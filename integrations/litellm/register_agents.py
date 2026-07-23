@@ -31,11 +31,7 @@ except ImportError:
     sys.exit(1)
 
 REPO_ROOT = Path(__file__).parent.parent.parent
-AGENT_DIRS = [
-    "academic", "design", "engineering", "finance", "game-development",
-    "marketing", "paid-media", "product", "project-management",
-    "sales", "spatial-computing", "specialized", "strategy", "support", "testing",
-]
+EXCLUDED_AGENT_DIRS = {"integrations", "scripts", "examples", ".github", ".git"}
 
 
 def slugify(name: str) -> str:
@@ -44,18 +40,41 @@ def slugify(name: str) -> str:
     return name.strip("-")
 
 
+def discover_agent_dirs(repo_root: Path) -> list[Path]:
+    """Return top-level category dirs that contain agent markdown files."""
+    if not repo_root.exists():
+        return []
+    agent_dirs: list[Path] = []
+    for child in sorted(repo_root.iterdir(), key=lambda path: path.name):
+        if not child.is_dir():
+            continue
+        if child.name.startswith(".") or child.name in EXCLUDED_AGENT_DIRS:
+            continue
+        if any(child.glob("*.md")):
+            agent_dirs.append(child)
+    return agent_dirs
+
+
+def warn_skipped_agent(path: Path, reason: str) -> None:
+    print(f"[register_agents] WARNING skipping agent file {path}: {reason}", file=sys.stderr)
+
+
 def parse_agent_file(path: Path) -> dict | None:
     text = path.read_text(encoding="utf-8")
     if not text.startswith("---"):
+        warn_skipped_agent(path, "no-frontmatter")
         return None
     end = text.find("---", 3)
     if end == -1:
+        warn_skipped_agent(path, "unterminated-frontmatter")
         return None
     try:
         fm = yaml.safe_load(text[3:end])
-    except yaml.YAMLError:
+    except yaml.YAMLError as e:
+        warn_skipped_agent(path, f"yaml-error: {e}")
         return None
-    if not fm or "name" not in fm:
+    if not isinstance(fm, dict) or "name" not in fm:
+        warn_skipped_agent(path, "no-name-field")
         return None
     body = text[end + 3:].strip()
     return {
@@ -71,11 +90,8 @@ def parse_agent_file(path: Path) -> dict | None:
 
 def collect_agents(category: str | None = None) -> list[dict]:
     agents = []
-    for cat in AGENT_DIRS:
-        if category and cat != category:
-            continue
-        cat_dir = REPO_ROOT / cat
-        if not cat_dir.exists():
+    for cat_dir in discover_agent_dirs(REPO_ROOT):
+        if category and cat_dir.name != category:
             continue
         for md_file in sorted(cat_dir.glob("*.md")):
             agent = parse_agent_file(md_file)

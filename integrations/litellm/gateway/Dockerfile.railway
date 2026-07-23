@@ -16,22 +16,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY integrations/litellm/gateway/main.py .
 
-# Bake all agent markdown files into the image
-COPY academic/          /agents-repo/academic/
-COPY design/            /agents-repo/design/
-COPY engineering/       /agents-repo/engineering/
-COPY finance/           /agents-repo/finance/
-COPY game-development/  /agents-repo/game-development/
-COPY marketing/         /agents-repo/marketing/
-COPY paid-media/        /agents-repo/paid-media/
-COPY product/           /agents-repo/product/
-COPY project-management/ /agents-repo/project-management/
-COPY sales/             /agents-repo/sales/
-COPY spatial-computing/ /agents-repo/spatial-computing/
-COPY specialized/       /agents-repo/specialized/
-COPY strategy/          /agents-repo/strategy/
-COPY support/           /agents-repo/support/
-COPY testing/           /agents-repo/testing/
+# Bake all agent markdown into the image. Copy the whole repo (see
+# .dockerignore for what's kept out); the gateway's discover_agent_dirs()
+# selects only top-level dirs containing *.md and excludes infra dirs, so new
+# upstream divisions (e.g. gis/healthcare/security) are picked up automatically
+# without editing this file. (Hardcoding the dir list here is what previously
+# dropped 28 agents after an upstream sync.)
+COPY . /agents-repo/
 
 ENV AGENTS_REPO_PATH=/agents-repo
 # LITELLM_API_BASE, LITELLM_API_KEY, DEFAULT_MODEL are set via Railway env vars

@@ -1,0 +1,13 @@
+# Keep the gateway image lean. NOTE: do NOT exclude integrations/ — the
+# Dockerfile.railway copies gateway/main.py and requirements.txt from there
+# before the whole-repo COPY. discover_agent_dirs() ignores integrations/ at
+# runtime anyway.
+.git
+.github
+node_modules
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.DS_Store
+*.log

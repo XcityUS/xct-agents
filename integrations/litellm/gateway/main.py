@@ -12,8 +12,11 @@ Env vars:
     LITELLM_API_KEY    API key for LiteLLM         (default: sk-1234)
     DEFAULT_MODEL      LLM model to use             (default: gpt-3.5-turbo)
     AGENTS_REPO_PATH   Path to xct-agents repo      (default: auto-detect)
+    GATEWAY_API_KEY    Optional bearer token for POST /agents/{slug}/
+    ALLOWED_MODELS     Optional comma-separated model allowlist
 """
 
+import hmac
 import json
 import os
 import re
@@ -32,12 +35,20 @@ import httpx
 LITELLM_BASE = os.getenv("LITELLM_API_BASE", "http://localhost:4000")
 LITELLM_KEY = os.getenv("LITELLM_API_KEY", "sk-1234")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-3.5-turbo")
+GATEWAY_API_KEY = os.getenv("GATEWAY_API_KEY", "")
 
-AGENT_DIRS = [
-    "academic", "design", "engineering", "finance", "game-development",
-    "marketing", "paid-media", "product", "project-management",
-    "sales", "spatial-computing", "specialized", "strategy", "support", "testing",
-]
+EXCLUDED_AGENT_DIRS = {"integrations", "scripts", "examples", ".github", ".git"}
+
+
+def _parse_allowed_models(value: str | None) -> set[str]:
+    if not value:
+        return set()
+    models = {model.strip() for model in value.split(",") if model.strip()}
+    models.add(DEFAULT_MODEL)
+    return models
+
+
+ALLOWED_MODELS = _parse_allowed_models(os.getenv("ALLOWED_MODELS"))
 
 
 def _find_repo_root() -> Path:
@@ -54,18 +65,41 @@ def slugify(name: str) -> str:
     return name.strip("-")
 
 
+def discover_agent_dirs(repo_root: Path) -> list[Path]:
+    """Return top-level category dirs that contain agent markdown files."""
+    if not repo_root.exists():
+        return []
+    agent_dirs: list[Path] = []
+    for child in sorted(repo_root.iterdir(), key=lambda path: path.name):
+        if not child.is_dir():
+            continue
+        if child.name.startswith(".") or child.name in EXCLUDED_AGENT_DIRS:
+            continue
+        if any(child.glob("*.md")):
+            agent_dirs.append(child)
+    return agent_dirs
+
+
+def warn_skipped_agent(path: Path, reason: str) -> None:
+    print(f"[gateway] WARNING skipping agent file {path}: {reason}", file=sys.stderr)
+
+
 def parse_agent_file(path: Path) -> dict | None:
     text = path.read_text(encoding="utf-8")
     if not text.startswith("---"):
+        warn_skipped_agent(path, "no-frontmatter")
         return None
     end = text.find("---", 3)
     if end == -1:
+        warn_skipped_agent(path, "unterminated-frontmatter")
         return None
     try:
         fm = yaml.safe_load(text[3:end])
-    except yaml.YAMLError:
+    except yaml.YAMLError as e:
+        warn_skipped_agent(path, f"yaml-error: {e}")
         return None
-    if not fm or "name" not in fm:
+    if not isinstance(fm, dict) or "name" not in fm:
+        warn_skipped_agent(path, "no-name-field")
         return None
     body = text[end + 3:].strip()
     return {
@@ -82,15 +116,30 @@ def parse_agent_file(path: Path) -> dict | None:
 def load_agents(repo_root: Path) -> dict[str, dict]:
     """Return {slug: agent_dict} for all agents."""
     registry: dict[str, dict] = {}
-    for cat in AGENT_DIRS:
-        cat_dir = repo_root / cat
-        if not cat_dir.exists():
-            continue
+    for cat_dir in discover_agent_dirs(repo_root):
         for md_file in sorted(cat_dir.glob("*.md")):
             agent = parse_agent_file(md_file)
             if agent:
                 registry[agent["slug"]] = agent
     return registry
+
+
+def require_gateway_auth(request: Request) -> None:
+    if not GATEWAY_API_KEY:
+        return
+    auth_header = request.headers.get("authorization", "")
+    scheme, _, token = auth_header.partition(" ")
+    if scheme.lower() != "bearer" or not hmac.compare_digest(token, GATEWAY_API_KEY):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def ensure_model_allowed(model: str) -> None:
+    if ALLOWED_MODELS and model not in ALLOWED_MODELS:
+        raise HTTPException(status_code=400, detail=f"Model '{model}' is not allowed")
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +156,8 @@ async def startup() -> None:
     repo_root = _find_repo_root()
     AGENTS = load_agents(repo_root)
     print(f"[gateway] Loaded {len(AGENTS)} agents from {repo_root}", file=sys.stderr)
+    if not GATEWAY_API_KEY:
+        print("[gateway] WARNING GATEWAY_API_KEY is unset; invoke auth is disabled", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +198,8 @@ async def agent_card(slug: str, request: Request) -> JSONResponse:
 # ---------------------------------------------------------------------------
 @app.post("/agents/{slug}/")
 async def invoke_agent(slug: str, request: Request) -> JSONResponse:
+    require_gateway_auth(request)
+
     agent = AGENTS.get(slug)
     if not agent:
         raise HTTPException(status_code=404, detail=f"Agent '{slug}' not found")
@@ -174,7 +227,8 @@ async def invoke_agent(slug: str, request: Request) -> JSONResponse:
     if not any(m.get("role") == "system" for m in messages):
         messages = [{"role": "system", "content": agent["system_prompt"]}] + messages
 
-    model = body.get("model", DEFAULT_MODEL)
+    model = body.get("model") or DEFAULT_MODEL
+    ensure_model_allowed(model)
 
     # Forward to LiteLLM
     payload = {

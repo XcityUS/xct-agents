@@ -99,6 +99,62 @@ curl http://localhost:4000/v1/chat/completions \
 
 ---
 
+### Approach C — Persona Skills (import personas into the skills registry)
+
+`import_skills.py` copies every agent persona into the proxy's xct-skills
+registry (`/v1/xct-skills`, backed by `LiteLLM_SkillsTable`). Each markdown
+file becomes one skill row whose `system_prompt_template` is the markdown body;
+callers then activate a persona by passing `skills` on a chat completion:
+
+```json
+{"model": "claude-sonnet-4-5", "skills": ["<skill_id>"], "messages": [...]}
+```
+
+This is the data migration behind Persona mode in xct-os — no gateway service
+and no config file, the personas live in the proxy DB.
+
+```bash
+pip install requests pyyaml
+export LITELLM_MASTER_KEY=sk-...          # proxy-admin key, env only — never a CLI flag
+
+# 1. always dry-run first: read-only, prints the create/update/unchanged plan
+python import_skills.py --litellm-base https://tokenhub.xcity.ai --dry-run
+
+# 2. import for real (265 personas from origin/main)
+python import_skills.py --litellm-base https://tokenhub.xcity.ai
+
+# 3. optional: dump slug -> skill_id so downstream apps can resolve personas
+python import_skills.py --litellm-base https://tokenhub.xcity.ai \
+  --export-map slug-to-skill-id.json
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--dry-run` | Print the plan, write nothing (still does read-only GETs when a key is set) |
+| `--ref` | Git ref to read agents from (default `origin/main`; `worktree` = files on disk) |
+| `--category` / `--limit` | Import a subset — handy for a first smoke test |
+| `--private` | Create rows with `is_public=false` (default is public so non-admin keys can list them) |
+| `--title-prefix` | Prefix `display_title`, e.g. `"XCT Agent — "`, to keep imported rows visually distinct |
+| `--force` | Re-push every persona even when the content fingerprint is unchanged |
+| `--export-map` | Write `{slug: skill_id}` JSON after the run |
+
+**Idempotency.** Imported rows carry `xct_metadata.source_repo = "xct-agents"`,
+`xct_metadata.xct_agent_slug`, and a `content_sha256` fingerprint. Re-running
+matches on the slug and PATCHes; unchanged personas are skipped without a write,
+so the script is safe to run repeatedly and safe to re-run after a partial
+failure (failures are listed at the end and the exit code is non-zero).
+
+**Caveats.**
+- `skill_id` is a server-generated uuid — the API has no field to set it, so the
+  agent slug lives in `xct_metadata.xct_agent_slug` (use `--export-map` for the
+  reverse lookup).
+- A row that has been published (`POST /v1/xct-skills/{id}/publish`) freezes its
+  content fields; updates to it return 409 and are reported as failures.
+- Imported rows are `source='custom'`, the same bucket as hand-made skills.
+  Downstream catalogs should filter on `xct_metadata.source_repo` to separate them.
+
+---
+
 ## Agent Naming Convention
 
 All agents are prefixed with `xct-` and slugified:
@@ -137,6 +193,7 @@ services:
 |--------|---------|
 | `generate_config.py` | Generate YAML config for model_list and/or agent_list |
 | `register_agents.py` | Register agents via LiteLLM `/v1/agents` API |
+| `import_skills.py` | Import agent personas into the `/v1/xct-skills` registry (Persona mode) |
 | `gateway/main.py` | FastAPI gateway — serves A2A endpoints for all agents |
 
 Run any script with `--help` for full options.
